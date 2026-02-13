@@ -6,6 +6,7 @@ import time
 from io import BytesIO
 from typing import Dict, List, Tuple
 import json
+from collections import defaultdict
 
 from settings import (
     LOGIN_URL,
@@ -157,16 +158,31 @@ def validate_user_data(user_data: Dict) -> Tuple[bool, str]:
     return True, ""
 
 
+def categorize_error(error_msg: str) -> str:
+    """Categoriza el error para mejor seguimiento"""
+    if "CEDULA_YA_REGISTRADA" in error_msg:
+        return "Cédula ya registrada"
+    elif "PENDIENTE" in error_msg:
+        return "Datos PENDIENTE"
+    elif "Timeout" in error_msg:
+        return "Timeout"
+    elif "Usuario ya existe" in error_msg:
+        return "Usuario duplicado"
+    elif "Cédula inválida" in error_msg:
+        return "Formato inválido"
+    elif "Error conexión" in error_msg:
+        return "Error de conexión"
+    else:
+        return "Otros errores"
+
+
 async def process_cedula(
     cedula: str, 
     token: str, 
     session: aiohttp.ClientSession
 ) -> Tuple[bool, Dict]:
     """
-    Procesa UNA cédula de forma secuencial:
-    1. GET user data
-    2. Validate
-    3. POST create user
+    Procesa UNA cédula de forma secuencial
     """
     
     cedula_clean = normalize_cedula(cedula)
@@ -231,7 +247,7 @@ async def process_all_cedulas_sequential(
     progress_callback
 ) -> Tuple[List[Dict], List[Dict]]:
     """
-    Procesamiento secuencial optimizado
+    Procesamiento secuencial optimizado con seguimiento de errores en tiempo real
     """
     successful = []
     failed = []
@@ -260,8 +276,9 @@ async def process_all_cedulas_sequential(
             else:
                 failed.append(result)
             
+            # Actualizar progreso con información de errores
             if progress_callback:
-                progress_callback(idx + 1, len(cedulas), len(failed))
+                progress_callback(idx + 1, len(cedulas), successful, failed)
     
     return successful, failed
 
@@ -276,9 +293,15 @@ def process_excel_sequential(df: pd.DataFrame, token: str) -> Tuple[List[Dict], 
     status_text = st.empty()
     stats_text = st.empty()
     
+    # Contenedor para errores en tiempo real
+    error_container = st.container()
+    with error_container:
+        error_header = st.empty()
+        error_metrics_container = st.empty()
+    
     start_time = time.time()
     
-    def update_progress(completed, total_count, failed_count):
+    def update_progress(completed, total_count, successful, failed):
         elapsed_time = time.time() - start_time
         progress = completed / total_count
         progress_bar.progress(min(progress, 1.0))
@@ -288,10 +311,29 @@ def process_excel_sequential(df: pd.DataFrame, token: str) -> Tuple[List[Dict], 
         
         status_text.text(f"Procesados: {completed}/{total_count} | Velocidad: {rate * 60:.2f} cédulas/min")
         stats_text.markdown(
-            f"**Fallidos:** {failed_count} | "
+            f"**Exitosos:** {len(successful)} | **Fallidos:** {len(failed)} | "
             f"**Tiempo transcurrido:** {format_time(elapsed_time)} | "
             f"**ETA:** {format_time(eta)}"
         )
+        
+        # Mostrar resumen de errores en tiempo real
+        if failed:
+            error_header.markdown("### 📊 Errores en Tiempo Real")
+            
+            # Categorizar errores
+            error_counts = defaultdict(int)
+            for error_record in failed:
+                category = categorize_error(error_record['razon'])
+                error_counts[category] += 1
+            
+            # Mostrar métricas de errores
+            num_categories = len(error_counts)
+            cols = error_metrics_container.columns(min(num_categories, 4))
+            
+            for idx, (category, count) in enumerate(sorted(error_counts.items(), key=lambda x: -x[1])):
+                col_idx = idx % 4
+                with cols[col_idx]:
+                    st.metric(category, count, delta=None)
     
     successful, failed = asyncio.run(
         process_all_cedulas_sequential(cedulas, token, update_progress)
@@ -302,7 +344,7 @@ def process_excel_sequential(df: pd.DataFrame, token: str) -> Tuple[List[Dict], 
     progress_bar.progress(1.0)
     status_text.text(f"¡Procesamiento completado! Procesados: {total}/{total}")
     stats_text.markdown(
-        f"**Total fallidos:** {len(failed)} | "
+        f"**Total exitosos:** {len(successful)} | **Total fallidos:** {len(failed)} | "
         f"**Tiempo total:** {format_time(total_time)} | "
         f"**Velocidad promedio:** {total/total_time:.2f} cédulas/seg"
     )
@@ -350,7 +392,7 @@ def main():
         "• 1 cédula a la vez (sin concurrencia)\n"
         "• Sesión HTTP compartida (keep-alive)\n"
         "• Connection pooling activo\n"
-        "• Ideal para APIs que se saturan fácilmente"
+        "• Seguimiento de errores en tiempo real"
     )
     
     # Credenciales de login
@@ -421,9 +463,9 @@ def main():
                 st.markdown("### 🔄 Procesamiento en curso (secuencial)...")
                 successful, failed, total_time = process_excel_sequential(df, token)
                 
-                # Mostrar resultados
+                # Mostrar resultados finales
                 st.markdown("---")
-                st.markdown("## 📊 Resultados del Procesamiento")
+                st.markdown("## 📊 Resultados Finales del Procesamiento")
                 
                 col1, col2, col3, col4 = st.columns(4)
                 
@@ -448,9 +490,9 @@ def main():
                     processing_speed = len(df) / total_time if total_time > 0 else 0
                     st.metric("Velocidad promedio", f"{processing_speed*60:.2f} cédulas/min")
                 
-                # Análisis de errores
+                # Análisis detallado de errores
                 if failed:
-                    st.markdown("### 🔍 Análisis de Errores")
+                    st.markdown("### 🔍 Análisis Detallado de Errores")
                     
                     df_failed = pd.DataFrame(failed)
                     error_counts = df_failed['razon'].value_counts()
@@ -458,20 +500,14 @@ def main():
                     col_err1, col_err2 = st.columns(2)
                     
                     with col_err1:
-                        st.markdown("**Top 5 Tipos de Error:**")
-                        for error, count in error_counts.head(5).items():
+                        st.markdown("**Top 10 Tipos de Error:**")
+                        for error, count in error_counts.head(10).items():
                             st.text(f"• {error}: {count}")
                     
                     with col_err2:
                         st.markdown("**Distribución:**")
-                        st.bar_chart(error_counts.head(5))
-                    
-                    if any("Timeout" in str(error) for error in error_counts.index):
-                        st.warning("⚠️ **Detectados timeouts:** El servidor está respondiendo lentamente")
-                    
-                    if any("PENDIENTE" in str(error) for error in error_counts.index):
-                        pendiente_count = sum(1 for e in error_counts.index if "PENDIENTE" in str(e))
-                        st.info(f"ℹ️ **{pendiente_count} registros con datos PENDIENTE**")
+                        st.bar_chart(error_counts.head(10))
+                                        
                 
                 # Mostrar exitosos
                 if successful:
